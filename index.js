@@ -404,10 +404,17 @@ export function apply(ctx, config = {}) {
     return { ok: true, cwd, policy }
   }
 
+  /**
+   * How many turns the session has actually completed. The projection's
+   * `lastTurn` counts an open turn, so it cannot answer "is there anything to
+   * fork from" on its own: on the first turn it already reads 1.
+   */
   function turnBoundary(session) {
     try {
       const boundary = ctx.agents.turnBoundaryOf(session)
-      return boundary && typeof boundary.lastTurn === 'number' ? boundary : undefined
+      if (boundary === undefined || boundary === null || typeof boundary.lastTurn !== 'number') return undefined
+      const open = boundary.openTurnStartSeq !== null && boundary.openTurnStartSeq !== undefined
+      return { completedTurns: open ? Math.max(boundary.lastTurn - 1, 0) : boundary.lastTurn }
     } catch {
       return undefined
     }
@@ -580,17 +587,103 @@ export function apply(ctx, config = {}) {
     return true
   }
 
+  /**
+   * Move the source conversation's still-queued human messages into the new one.
+   *
+   * A fork only inherits completed turns, so input the user queued while the
+   * source was still working is left behind — and, because the plugin opens the
+   * new conversation immediately, it also disappears from view. Carry those
+   * messages across instead so they stay queued (and visible) where the user
+   * now is. Removal from the source is the commit point: a message the running
+   * turn already claimed cannot be removed and therefore stays where it was
+   * claimed, while everything removed here is appended to the target exactly
+   * once.
+   *
+   * Only human prompts (`source.kind === 'user'`) move: goal rounds, scheduled
+   * deliveries, and subagent reports belong to the conversation that produced
+   * them and must stay there.
+   *
+   * A message can also arrive through the fork's inherited event prefix (queued
+   * before the cut but claimed by the source afterwards). It is kept only when
+   * the source still had it queued, and the stale inherited copies are dropped
+   * so the new conversation never replays work the source already did.
+   *
+   * @param fromAgent - source Agent whose pending input is transferred.
+   * @param toAgent - forked Agent that should receive it.
+   * @param wake - whether to wake the target when the caller has no message of
+   *   its own to deliver.
+   * @returns how many queued messages now belong to the target conversation.
+   */
+  function carryQueuedMessages(fromAgent, toAgent, wake) {
+    if (!fromAgent || !toAgent || fromAgent === toAgent) return 0
+    let queued
+    try {
+      queued = [...fromAgent.inbox.nextTurn]
+    } catch (error) {
+      warn('reading the source conversation queued messages failed', error)
+      return 0
+    }
+    let inherited = new Set()
+    try {
+      inherited = new Set(toAgent.inbox.nextTurn.map((message) => message.id))
+    } catch {
+      // An unreadable target inbox simply means every message is forwarded.
+    }
+
+    const kept = new Set()
+    const forwarded = []
+    for (const message of queued) {
+      const source = message === null || typeof message !== 'object' ? undefined : message.source
+      if (source === undefined || source === null || source.kind !== 'user') continue
+      let removed = false
+      try {
+        removed = fromAgent.inbox.remove(message.id) === true
+      } catch (error) {
+        warn(`removing queued message ${String(message.id)} from the source conversation failed`, error)
+        continue
+      }
+      if (!removed) continue
+      kept.add(message.id)
+      if (!inherited.has(message.id)) forwarded.push(message)
+    }
+
+    for (const [index, message] of forwarded.entries()) {
+      try {
+        toAgent.send(message, 'next-turn', wake && index === forwarded.length - 1)
+      } catch (error) {
+        warn(`forwarding queued message ${String(message.id)} to the new conversation failed`, error)
+      }
+    }
+
+    try {
+      for (const message of [...toAgent.inbox.nextTurn]) {
+        if (!kept.has(message.id)) toAgent.inbox.remove(message.id)
+      }
+    } catch (error) {
+      warn('dropping stale inherited queued messages failed', error)
+    }
+    return kept.size
+  }
+
   async function createFlow(invocation, message) {
     const signal = invocation.signal
-    const preflight = await preflightRepository(invocation.agent, signal)
-    if (!preflight.ok) return { kind: 'error', text: preflight.error }
-    await ensureLinksLoaded()
-
     const parentSession = ctx.sessions.get(invocation.agent.id)
     const boundary = parentSession === undefined ? undefined : turnBoundary(parentSession)
     // A brand-new conversation has nothing to fork. Move that very Session into
-    // the worktree instead, so its first message starts there.
-    const blankSource = boundary !== undefined && boundary.lastTurn === 0
+    // the worktree instead, so its first message starts there. A first turn
+    // that is still open is NOT blank: moving the directory under it would
+    // strand the work already done in the source checkout.
+    const blankSource = boundary !== undefined && boundary.completedTurns === 0
+    if (blankSource && invocation.agent.status === 'running') {
+      return {
+        kind: 'error',
+        text: '当前对话的第一个回合仍在运行，还没有可以 fork 的已完成回合。请等这一回合结束或先停止它，再执行 /worktree。',
+      }
+    }
+
+    const preflight = await preflightRepository(invocation.agent, signal)
+    if (!preflight.ok) return { kind: 'error', text: preflight.error }
+    await ensureLinksLoaded()
 
     let targetAgent
     let targetSession
@@ -650,10 +743,16 @@ export function apply(ctx, config = {}) {
     }
     await rememberLink(link)
 
+    const attachments = Array.isArray(invocation.attachments) ? invocation.attachments : []
+    const hasOwnMessage = message !== '' || attachments.length > 0
+    // The fork cut at the last completed turn, so input still queued in the
+    // source would otherwise be stranded there while the UI follows the new
+    // conversation. Move it across before the command's own message wakes it.
+    const carried = forked ? carryQueuedMessages(invocation.agent, targetAgent, !hasOwnMessage) : 0
+
     let delivered = false
     let deliveryError = ''
-    const attachments = Array.isArray(invocation.attachments) ? invocation.attachments : []
-    if (message !== '' || attachments.length > 0) {
+    if (hasOwnMessage) {
       try {
         delivered = await deliverFirstMessage(targetAgent, targetSession, message, attachments)
       } catch (error) {
@@ -671,6 +770,7 @@ export function apply(ctx, config = {}) {
         `路径：${link.path}`,
         `分支：${link.branch}${short === '' ? '' : `（基于 ${short}）`}`,
         delivered ? '随命令发送的消息已进入该对话，会直接在 worktree 中开始处理。' : '',
+        carried === 0 ? '' : `原对话中排队的 ${carried} 条消息也已转入这个对话，会按顺序继续处理。`,
         deliveryError === '' ? '' : `消息发送失败：${deliveryError}`,
         '删除方式：在该对话中执行 /worktree off，或归档该对话。',
         '',
