@@ -568,7 +568,13 @@ export function apply(ctx, config = {}) {
     return freeze(message)
   }
 
-  async function deliverFirstMessage(targetAgent, targetSession, message, attachments) {
+  /**
+   * Deliver the command message from the Host. Only messages carrying
+   * attachments take this path: the Web client forwards text through the
+   * ordinary prompt pipeline, but command attachments are already serialized
+   * for the Host and their draft records are released when the command settles.
+   */
+  async function deliverHostMessage(targetAgent, targetSession, message, attachments) {
     const content = []
     if (typeof message === 'string' && message !== '') content.push({ type: 'text', text: message })
     for (const block of attachments) content.push(block)
@@ -640,13 +646,16 @@ export function apply(ctx, config = {}) {
    * the source still had it queued, and the stale inherited copies are dropped
    * so the new conversation never replays work the source already did.
    *
+   * Once the transfer is clean, the last carried message is re-appended with a
+   * wake so the target is already running when the command's own message
+   * arrives; that message then queues visibly instead of racing the carried
+   * input for the first turn.
+   *
    * @param fromAgent - source Agent whose pending input is transferred.
    * @param toAgent - forked Agent that should receive it.
-   * @param wake - whether to wake the target when the caller has no message of
-   *   its own to deliver.
    * @returns how many queued messages now belong to the target conversation.
    */
-  function carryQueuedMessages(fromAgent, toAgent, wake) {
+  function carryQueuedMessages(fromAgent, toAgent) {
     if (!fromAgent || !toAgent || fromAgent === toAgent) return 0
     let queued
     try {
@@ -679,9 +688,9 @@ export function apply(ctx, config = {}) {
       if (!inherited.has(message.id)) forwarded.push(message)
     }
 
-    for (const [index, message] of forwarded.entries()) {
+    for (const message of forwarded) {
       try {
-        toAgent.send(message, 'next-turn', wake && index === forwarded.length - 1)
+        toAgent.send(message, 'next-turn', false)
       } catch (error) {
         warn(`forwarding queued message ${String(message.id)} to the new conversation failed`, error)
       }
@@ -693,6 +702,16 @@ export function apply(ctx, config = {}) {
       }
     } catch (error) {
       warn('dropping stale inherited queued messages failed', error)
+    }
+
+    try {
+      const remaining = [...toAgent.inbox.nextTurn]
+      const last = remaining.at(-1)
+      if (last !== undefined && toAgent.inbox.remove(last.id) === true) {
+        toAgent.send(last, 'next-turn', true)
+      }
+    } catch (error) {
+      warn('waking the carried queued messages failed', error)
     }
     return kept.size
   }
@@ -779,18 +798,23 @@ export function apply(ctx, config = {}) {
     // would otherwise show the source conversation's title again in the sidebar.
     nameFromMessage(targetSession, message, forked)
 
-    const attachments = Array.isArray(invocation.attachments) ? invocation.attachments : []
-    const hasOwnMessage = message !== '' || attachments.length > 0
     // The fork cut at the last completed turn, so input still queued in the
     // source would otherwise be stranded there while the UI follows the new
-    // conversation. Move it across before the command's own message wakes it.
-    const carried = forked ? carryQueuedMessages(invocation.agent, targetAgent, !hasOwnMessage) : 0
+    // conversation. Move it across without waking: waking inside the transfer
+    // would let the target claim a stale inherited message before the cleanup
+    // below runs. The command's own message (sent by the Web client) wakes the
+    // target afterwards, so this input queues behind it like any other message.
+    const carried = forked ? carryQueuedMessages(invocation.agent, targetAgent) : 0
 
+    // Attachments stay on the Host path: they are already serialized for the
+    // command and their browser draft records are released once it settles.
+    const attachments = Array.isArray(invocation.attachments) ? invocation.attachments : []
+    const hostDelivers = attachments.length > 0
     let delivered = false
     let deliveryError = ''
-    if (hasOwnMessage) {
+    if (hostDelivers) {
       try {
-        delivered = await deliverFirstMessage(targetAgent, targetSession, message, attachments)
+        delivered = await deliverHostMessage(targetAgent, targetSession, message, attachments)
       } catch (error) {
         deliveryError = messageOf(error)
       }
@@ -805,9 +829,12 @@ export function apply(ctx, config = {}) {
           : '已 fork 当前对话，并让新对话在这个 worktree 中工作。',
         `路径：${link.path}`,
         `分支：${link.branch}${short === '' ? '' : `（基于 ${short}）`}`,
-        delivered ? '随命令发送的消息已进入该对话，会直接在 worktree 中开始处理。' : '',
-        carried === 0 ? '' : `原对话中排队的 ${carried} 条消息也已转入这个对话，会按顺序继续处理。`,
-        deliveryError === '' ? '' : `消息发送失败：${deliveryError}`,
+        hostDelivers
+          ? delivered
+            ? '随命令发送的消息已进入该对话，会按顺序继续处理。'
+            : `消息发送失败：${deliveryError}`
+          : '随命令发送的消息会作为普通消息在新对话中发送。',
+        carried === 0 ? '' : `原对话中排队的 ${carried} 条消息也已在前面排队，会按顺序继续处理。`,
         '删除方式：在该对话中执行 /worktree off，或归档该对话。',
         '',
         `Worktree: ${link.path}`,
