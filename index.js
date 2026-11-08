@@ -588,6 +588,38 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * Name the worktree conversation after the message that started it.
+   *
+   * A fork inherits the source conversation's title, so the sidebar would show
+   * two rows reading the same thing. The title service normalizes and caps the
+   * text, pins it against automatic generation, and requires a live Session;
+   * a missing service or a no-longer-live Session only costs the title.
+   *
+   * @param session - target Session to rename.
+   * @param message - the text typed after `/worktree`.
+   * @param forked - whether the target is a new conversation (always rename) or
+   *   the source conversation moved in place (keep a title the user already
+   *   chose).
+   */
+  function nameFromMessage(session, message, forked) {
+    if (session === undefined || message === '') return
+    const titles = ctx.get('sessionTitle')
+    if (titles === undefined || typeof titles.rename !== 'function') return
+    if (!forked) {
+      try {
+        if (titles.get(session) !== undefined) return
+      } catch {
+        return
+      }
+    }
+    try {
+      titles.rename(session, message)
+    } catch (error) {
+      warn('naming the worktree conversation after its message failed', error)
+    }
+  }
+
+  /**
    * Move the source conversation's still-queued human messages into the new one.
    *
    * A fork only inherits completed turns, so input the user queued while the
@@ -743,6 +775,10 @@ export function apply(ctx, config = {}) {
     }
     await rememberLink(link)
 
+    // The new conversation is named after the message that starts it; a fork
+    // would otherwise show the source conversation's title again in the sidebar.
+    nameFromMessage(targetSession, message, forked)
+
     const attachments = Array.isArray(invocation.attachments) ? invocation.attachments : []
     const hasOwnMessage = message !== '' || attachments.length > 0
     // The fork cut at the last completed turn, so input still queued in the
@@ -871,6 +907,13 @@ export function apply(ctx, config = {}) {
 
   async function handleCommand(invocation) {
     const input = String(invocation.rawInput === undefined ? '' : invocation.rawInput).trim()
+    // A message is mandatory: without one there is nothing to start in the
+    // worktree and nothing to name the new conversation after. Throwing (rather
+    // than returning an error result) keeps the command chip and the typed
+    // draft in the composer, so the user can simply continue typing.
+    if (input === '') {
+      throw new Error('/worktree 后面需要一条消息，例如：/worktree 修复登录问题。')
+    }
     try {
       if (input.toLowerCase() === 'off') {
         if (Array.isArray(invocation.attachments) && invocation.attachments.length > 0) {
@@ -889,7 +932,7 @@ export function apply(ctx, config = {}) {
       ctx.commands.register({
         name: 'worktree',
         description:
-          'Create a Git worktree and continue there; a following message becomes its first prompt, "off" removes it.',
+          'Create a Git worktree and continue there; the following message becomes its first prompt and title, "off" removes it.',
         input: { hint: 'off | <message>', attachments: true },
         handler: (invocation) => handleCommand(invocation),
       }),
