@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Worktree 对话",
+    "description": "把当前对话 fork 到新的 Git worktree，并在对话被归档或执行 /worktree off 时删除该 worktree。"
+  }
+}

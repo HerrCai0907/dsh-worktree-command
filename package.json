@@ -1,0 +1,38 @@
+{
+  "name": "@local/dsh-worktree-command",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fork a conversation into a new Git worktree and remove that worktree on archive or with /worktree off.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

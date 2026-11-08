@@ -1,0 +1,15 @@
+# Host row of the /worktree bundle. The browser half is declared by `dsh.client`
+# in package.json, so this single row activates both sides.
+#
+# Optional raw config keys (all have defaults; add them under `config:` when you
+# need to change them):
+#   backend: json              storage backend holding the session/worktree links
+#   autoRemoveOnArchive: true  delete the worktree when its conversation is archived
+#   removeBranch: false        also delete the created branch after removing the checkout
+#   gitCommand: git            executable resolved through the subprocess provider
+#   gitTimeoutMs: 120000       per-git-command deadline in milliseconds
+#   maxOutputBytes: 65536      per-stream capture cap for git output
+#   idleWaitMs: 15000          bound on waiting for a running agent before cleanup
+- insert:
+    - id: worktree-command
+      name: '@local/dsh-worktree-command'

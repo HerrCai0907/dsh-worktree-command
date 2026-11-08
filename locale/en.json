@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Worktree conversations",
+    "description": "Fork the current conversation into a new Git worktree and remove that worktree when the conversation is archived or with /worktree off."
+  }
+}
